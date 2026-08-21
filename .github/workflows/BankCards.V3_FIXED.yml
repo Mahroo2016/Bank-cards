@@ -1,0 +1,637 @@
+name: Build Card Vault APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Create Android project
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p app/src/main/java/com/example/cardvault
+          mkdir -p app/src/main/res/values
+
+          cat > settings.gradle <<'GRADLE'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "CardVault"
+          include(":app")
+          GRADLE
+
+          cat > build.gradle <<'GRADLE'
+          plugins {
+              id 'com.android.application' version '8.6.1' apply false
+          }
+          GRADLE
+
+          cat > app/build.gradle <<'GRADLE'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.example.cardvault'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'com.example.cardvault'
+                  minSdk 23
+                  targetSdk 35
+                  versionCode 1
+                  versionName "1.0"
+              }
+          }
+          GRADLE
+
+          cat > app/src/main/res/values/strings.xml <<'XML'
+          <resources>
+              <string name="app_name">کیف کارت بانکی</string>
+          </resources>
+          XML
+
+          cat > app/src/main/res/values/styles.xml <<'XML'
+          <resources>
+              <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+                  <item name="android:fontFamily">sans</item>
+                  <item name="android:windowLightStatusBar">true</item>
+                  <item name="android:statusBarColor">#F7F5FA</item>
+                  <item name="android:navigationBarColor">#F7F5FA</item>
+                  <item name="android:colorAccent">#6C4AB6</item>
+                  <item name="android:windowActionModeOverlay">true</item>
+              </style>
+          </resources>
+          XML
+
+          cat > app/src/main/AndroidManifest.xml <<'XML'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.USE_FINGERPRINT" />
+
+              <application
+                  android:theme="@style/AppTheme"
+                  android:label="@string/app_name"
+                  android:allowBackup="false"
+                  android:supportsRtl="true">
+                  <activity
+                      android:name=".MainActivity"
+                      android:screenOrientation="portrait"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          XML
+
+          cat > app/src/main/java/com/example/cardvault/MainActivity.java <<'JAVA'
+          package com.example.cardvault;
+
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.app.KeyguardManager;
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.hardware.fingerprint.FingerprintManager;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.security.keystore.KeyGenParameterSpec;
+          import android.security.keystore.KeyProperties;
+          import android.text.InputType;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import java.nio.charset.StandardCharsets;
+          import java.security.KeyStore;
+          import java.security.MessageDigest;
+          import java.security.NoSuchAlgorithmException;
+          import java.util.ArrayList;
+          import android.util.Base64;
+          import java.util.Locale;
+
+          import javax.crypto.Cipher;
+          import javax.crypto.KeyGenerator;
+          import javax.crypto.SecretKey;
+          import javax.crypto.spec.GCMParameterSpec;
+          import javax.crypto.spec.SecretKeySpec;
+
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          public class MainActivity extends Activity {
+              private static final String PREFS = "card_vault_secure";
+              private static final String DATA_KEY = "cards";
+              private static final String PIN_KEY = "pin_hash";
+              private static final String KEYSTORE = "AndroidKeyStore";
+              private static final String AES_ALIAS = "CardVaultAES";
+              private static final int REQ_FINGERPRINT = 9001;
+
+              private SharedPreferences prefs;
+              private LinearLayout root;
+              private boolean unlocked = false;
+              private JSONArray cards = new JSONArray();
+
+              @Override
+              public void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  getWindow().setStatusBarColor(Color.rgb(247,245,250));
+                  getWindow().setNavigationBarColor(Color.rgb(247,245,250));
+                  if (Build.VERSION.SDK_INT >= 23) {
+                      getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
+                  }
+                  prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+                  if (!hasPin()) {
+                      showPinSetup();
+                  } else {
+                      showUnlock();
+                  }
+              }
+
+              private TextView text(String s, float size) {
+                  TextView t = new TextView(this);
+                  t.setText(s);
+                  t.setTextSize(size);
+                  t.setTextColor(Color.rgb(35,35,40));
+                  t.setPadding(16, 12, 16, 12);
+                  return t;
+              }
+
+              private Button button(String s) {
+                  Button b = new Button(this);
+                  b.setText(s);
+                  b.setTextSize(15);
+                  b.setAllCaps(false);
+                  return b;
+              }
+
+              private boolean hasPin() {
+                  return !prefs.getString(PIN_KEY, "").isEmpty();
+              }
+
+              private String hashPin(String pin) {
+                  try {
+                      MessageDigest md = MessageDigest.getInstance("SHA-256");
+                      byte[] out = md.digest(pin.getBytes(StandardCharsets.UTF_8));
+                      StringBuilder sb = new StringBuilder();
+                      for (byte x : out) sb.append(String.format(Locale.US, "%02x", x));
+                      return sb.toString();
+                  } catch (NoSuchAlgorithmException e) {
+                      return "";
+                  }
+              }
+
+              private void showPinSetup() {
+                  LinearLayout box = new LinearLayout(this);
+                  box.setOrientation(LinearLayout.VERTICAL);
+                  box.setPadding(28, 20, 28, 20);
+
+                  TextView title = text("🔐 ساخت PIN", 25);
+                  title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+                  title.setGravity(Gravity.CENTER);
+                  box.addView(title);
+
+                  TextView info = text("برای امنیت کارت‌ها یک PIN چهار تا هشت رقمی بسازید.", 16);
+                  info.setGravity(Gravity.CENTER);
+                  box.addView(info);
+
+                  EditText p1 = new EditText(this);
+                  p1.setHint("PIN جدید");
+                  p1.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD);
+                  box.addView(p1);
+
+                  EditText p2 = new EditText(this);
+                  p2.setHint("تکرار PIN");
+                  p2.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD);
+                  box.addView(p2);
+
+                  Button save = button("ذخیره PIN");
+                  box.addView(save);
+
+                  root = box;
+                  setContentView(root);
+
+                  save.setOnClickListener(v -> {
+                      String a = p1.getText().toString();
+                      String c = p2.getText().toString();
+                      if (a.length() < 4 || a.length() > 8 || !a.matches("\\d+")) {
+                          toast("PIN باید ۴ تا ۸ رقم باشد.");
+                          return;
+                      }
+                      if (!a.equals(c)) {
+                          toast("دو PIN یکسان نیستند.");
+                          return;
+                      }
+                      prefs.edit().putString(PIN_KEY, hashPin(a)).apply();
+                      toast("PIN ساخته شد.");
+                      showUnlock();
+                  });
+              }
+
+              private void showUnlock() {
+                  LinearLayout box = new LinearLayout(this);
+                  box.setOrientation(LinearLayout.VERTICAL);
+                  box.setPadding(28, 30, 28, 30);
+
+                  TextView title = text("🔐 کیف کارت بانکی", 27);
+                  title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+                  title.setGravity(Gravity.CENTER);
+                  box.addView(title);
+
+                  TextView info = text("برای ورود PIN را وارد کنید یا از اثر انگشت استفاده کنید.", 16);
+                  info.setGravity(Gravity.CENTER);
+                  box.addView(info);
+
+                  EditText pin = new EditText(this);
+                  pin.setHint("PIN");
+                  pin.setGravity(Gravity.CENTER);
+                  pin.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD);
+                  box.addView(pin);
+
+                  Button enter = button("ورود با PIN");
+                  box.addView(enter);
+
+                  Button finger = button("👆 ورود با اثر انگشت");
+                  box.addView(finger);
+
+                  setContentView(box);
+
+                  enter.setOnClickListener(v -> {
+                      if (hashPin(pin.getText().toString()).equals(prefs.getString(PIN_KEY, ""))) {
+                          unlocked = true;
+                          showHome();
+                      } else {
+                          toast("PIN اشتباه است.");
+                      }
+                  });
+
+                  finger.setOnClickListener(v -> fingerprintLogin());
+
+                  if (Build.VERSION.SDK_INT >= 23) {
+                      FingerprintManager fm = (FingerprintManager) getSystemService(FINGERPRINT_SERVICE);
+                      KeyguardManager km = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
+                      boolean available = fm != null && fm.isHardwareDetected() && fm.hasEnrolledFingerprints()
+                              && km != null && km.isKeyguardSecure();
+                      finger.setEnabled(available);
+                      if (!available) finger.setText("👆 اثر انگشت در این گوشی فعال نیست");
+                  }
+              }
+
+              private void fingerprintLogin() {
+                  if (Build.VERSION.SDK_INT < 23) {
+                      toast("اثر انگشت در این نسخه اندروید پشتیبانی نمی‌شود.");
+                      return;
+                  }
+                  try {
+                      FingerprintManager fm = (FingerprintManager) getSystemService(FINGERPRINT_SERVICE);
+                      KeyguardManager km = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
+                      if (fm == null || !fm.isHardwareDetected() || !fm.hasEnrolledFingerprints()
+                              || km == null || !km.isKeyguardSecure()) {
+                          toast("ابتدا اثر انگشت را در تنظیمات گوشی ثبت کنید.");
+                          return;
+                      }
+
+                      Cipher cipher = Cipher.getInstance("AES/CBC/PKCS7Padding");
+                      SecretKey key = getOrCreateKey();
+                      cipher.init(Cipher.ENCRYPT_MODE, key);
+                      FingerprintManager.CryptoObject crypto = new FingerprintManager.CryptoObject(cipher);
+
+                      fm.authenticate(crypto, null, 0, new FingerprintManager.AuthenticationCallback() {
+                          @Override public void onAuthenticationSucceeded(FingerprintManager.AuthenticationResult result) {
+                              runOnUiThread(() -> {
+                                  unlocked = true;
+                                  showHome();
+                              });
+                          }
+                          @Override public void onAuthenticationFailed() {
+                              runOnUiThread(() -> toast("اثر انگشت شناسایی نشد."));
+                          }
+                          @Override public void onAuthenticationError(int errMsgId, CharSequence errString) {
+                              runOnUiThread(() -> toast(errString.toString()));
+                          }
+                      }, null);
+                  } catch (Exception e) {
+                      toast("ورود با اثر انگشت در این دستگاه در دسترس نیست.");
+                  }
+              }
+
+              private SecretKey getOrCreateKey() throws Exception {
+                  KeyStore ks = KeyStore.getInstance(KEYSTORE);
+                  ks.load(null);
+                  if (ks.containsAlias(AES_ALIAS)) {
+                      return ((KeyStore.SecretKeyEntry) ks.getEntry(AES_ALIAS, null)).getSecretKey();
+                  }
+                  KeyGenerator kg = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE);
+                  kg.init(new KeyGenParameterSpec.Builder(AES_ALIAS,
+                          KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT)
+                          .setBlockModes(KeyProperties.BLOCK_MODE_CBC, KeyProperties.BLOCK_MODE_GCM)
+                          .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_PKCS7, KeyProperties.ENCRYPTION_PADDING_NONE)
+                          .setUserAuthenticationRequired(false)
+                          .build());
+                  return kg.generateKey();
+              }
+
+              private String encrypt(String plain) throws Exception {
+                  SecretKey key = getOrCreateKey();
+                  Cipher c = Cipher.getInstance("AES/GCM/NoPadding");
+                  c.init(Cipher.ENCRYPT_MODE, key);
+                  byte[] iv = c.getIV();
+                  byte[] enc = c.doFinal(plain.getBytes(StandardCharsets.UTF_8));
+                  return Base64.encodeToString(iv, Base64.NO_WRAP) + ":" +
+                          Base64.encodeToString(enc, Base64.NO_WRAP);
+              }
+
+              private String decrypt(String value) throws Exception {
+                  String[] p = value.split(":");
+                  if (p.length != 2) throw new Exception("bad data");
+                  byte[] iv = Base64.decode(p[0], Base64.NO_WRAP);
+                  byte[] enc = Base64.decode(p[1], Base64.NO_WRAP);
+                  Cipher c = Cipher.getInstance("AES/GCM/NoPadding");
+                  c.init(Cipher.DECRYPT_MODE, getOrCreateKey(), new GCMParameterSpec(128, iv));
+                  return new String(c.doFinal(enc), StandardCharsets.UTF_8);
+              }
+
+              private void loadCards() {
+                  try {
+                      String e = prefs.getString(DATA_KEY, "");
+                      cards = e.isEmpty() ? new JSONArray() : new JSONArray(decrypt(e));
+                  } catch (Exception ex) {
+                      cards = new JSONArray();
+                  }
+              }
+
+              private void saveCards() {
+                  try {
+                      prefs.edit().putString(DATA_KEY, encrypt(cards.toString())).apply();
+                  } catch (Exception e) {
+                      toast("ذخیره امن اطلاعات انجام نشد.");
+                  }
+              }
+
+              private void showHome() {
+                  loadCards();
+                  LinearLayout page = new LinearLayout(this);
+                  page.setOrientation(LinearLayout.VERTICAL);
+                  page.setPadding(18, 10, 18, 10);
+                  page.setBackgroundColor(Color.rgb(247,245,250));
+
+                  TextView title = text("کارت‌های بانکی", 26);
+                  title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+                  title.setGravity(Gravity.CENTER);
+                  title.setPadding(16, 32, 16, 24);
+                  page.addView(title);
+
+                  TextView sub = text("اطلاعات کارت‌ها به‌صورت رمزنگاری‌شده روی همین گوشی نگهداری می‌شود.", 14);
+                  sub.setGravity(Gravity.CENTER);
+                  page.addView(sub);
+
+                  Button add = button("＋ افزودن کارت بانکی");
+                  page.addView(add);
+
+                  ScrollView scroll = new ScrollView(this);
+                  LinearLayout list = new LinearLayout(this);
+                  list.setOrientation(LinearLayout.VERTICAL);
+                  scroll.addView(list);
+                  page.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
+
+                  Button lock = button("🔒 قفل کردن برنامه");
+                  page.addView(lock);
+
+                  setContentView(page);
+
+                  renderCards(list);
+                  add.setOnClickListener(v -> showCardForm(-1));
+                  lock.setOnClickListener(v -> {
+                      unlocked = false;
+                      showUnlock();
+                  });
+              }
+
+              private void renderCards(LinearLayout list) {
+                  list.removeAllViews();
+                  if (cards.length() == 0) {
+                      TextView empty = text("هنوز کارتی ثبت نشده است.", 17);
+                      empty.setGravity(Gravity.CENTER);
+                      list.addView(empty);
+                      return;
+                  }
+                  for (int i = 0; i < cards.length(); i++) {
+                      try {
+                          JSONObject c = cards.getJSONObject(i);
+                          TextView item = text("🏦 " + c.optString("bank", "بانک") +
+                                  "\\n" + maskCard(c.optString("number", "")) +
+                                  "\\nانقضا: " + c.optString("month","--") + "/" + c.optString("year","--") +
+                                  "\\nCVV2: ••••", 17);
+                          item.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+                          list.addView(item);
+
+                          LinearLayout actions = new LinearLayout(this);
+                          Button view = button("مشاهده CVV2");
+                          Button edit = button("ویرایش");
+                          Button del = button("حذف");
+                          actions.addView(view, new LinearLayout.LayoutParams(0,-2,1));
+                          actions.addView(edit, new LinearLayout.LayoutParams(0,-2,1));
+                          actions.addView(del, new LinearLayout.LayoutParams(0,-2,1));
+                          list.addView(actions);
+
+                          int idx = i;
+                          view.setOnClickListener(v -> askPinForCvv(idx));
+                          edit.setOnClickListener(v -> showCardForm(idx));
+                          del.setOnClickListener(v -> {
+                              new AlertDialog.Builder(this)
+                                  .setTitle("حذف کارت")
+                                  .setMessage("این کارت حذف شود؟")
+                                  .setNegativeButton("لغو", null)
+                                  .setPositiveButton("حذف", (d,w) -> {
+                                      cards.remove(idx);
+                                      saveCards();
+                                      showHome();
+                                  }).show();
+                          });
+                      } catch (Exception ignored) {}
+                  }
+              }
+
+              private String maskCard(String n) {
+                  if (n.length() != 16) return "----";
+                  return n.substring(0,4) + " **** **** " + n.substring(12);
+              }
+
+              private void askPinForCvv(int index) {
+                  EditText p = new EditText(this);
+                  p.setHint("PIN");
+                  p.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD);
+                  new AlertDialog.Builder(this)
+                      .setTitle("🔒 نمایش CVV2")
+                      .setMessage("برای نمایش CVV2، PIN را وارد کنید.")
+                      .setView(p)
+                      .setNegativeButton("لغو", null)
+                      .setPositiveButton("نمایش", (d,w) -> {
+                          if (!hashPin(p.getText().toString()).equals(prefs.getString(PIN_KEY, ""))) {
+                              toast("PIN اشتباه است.");
+                              return;
+                          }
+                          try {
+                              JSONObject c = cards.getJSONObject(index);
+                              new AlertDialog.Builder(this)
+                                  .setTitle("CVV2")
+                                  .setMessage(c.optString("cvv2",""))
+                                  .setPositiveButton("باشه", null)
+                                  .show();
+                          } catch (Exception ignored) {}
+                      }).show();
+              }
+
+              private void showCardForm(int index) {
+                  boolean edit = index >= 0;
+                  JSONObject old = null;
+                  try { if (edit) old = cards.getJSONObject(index); } catch (Exception ignored) {}
+
+                  LinearLayout box = new LinearLayout(this);
+                  box.setOrientation(LinearLayout.VERTICAL);
+                  box.setPadding(22, 12, 22, 12);
+
+                  TextView title = text(edit ? "ویرایش کارت" : "افزودن کارت جدید", 23);
+                  title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+                  title.setGravity(Gravity.CENTER);
+                  box.addView(title);
+
+                  EditText bank = field("نام بانک", old == null ? "" : old.optString("bank",""));
+                  EditText number = field("شماره کارت ۱۶ رقمی", old == null ? "" : old.optString("number",""));
+                  number.setInputType(InputType.TYPE_CLASS_NUMBER);
+                  number.setSingleLine(true);
+                  number.setMaxLength(16);
+                  EditText shaba = field("شماره شبا (IR...)", old == null ? "" : old.optString("shaba",""));
+                  EditText month = field("ماه انقضا (۲ رقم)", old == null ? "" : old.optString("month",""));
+                  EditText year = field("سال انقضا (۲ رقم)", old == null ? "" : old.optString("year",""));
+                  EditText cvv = field("CVV2 (۳ یا ۴ رقم)", old == null ? "" : old.optString("cvv2",""));
+                  cvv.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD);
+
+                  box.addView(bank);
+                  box.addView(number);
+                  box.addView(shaba);
+                  box.addView(month);
+                  box.addView(year);
+                  box.addView(cvv);
+
+                  TextView hint = text("شماره کارت دقیقاً ۱۶ رقم و بدون فاصله است. ماه و سال جداگانه وارد می‌شوند.", 13);
+                  box.addView(hint);
+
+                  Button save = button(edit ? "ذخیره تغییرات" : "ثبت کارت");
+                  box.addView(save);
+
+                  setContentView(box);
+
+                  save.setOnClickListener(v -> {
+                      String b = bank.getText().toString().trim();
+                      String n = number.getText().toString().trim();
+                      String s = shaba.getText().toString().trim().replace(" ","");
+                      String m = month.getText().toString().trim();
+                      String y = year.getText().toString().trim();
+                      String c = cvv.getText().toString().trim();
+
+                      if (!n.matches("\\d{16}")) {
+                          toast("شماره کارت باید دقیقاً ۱۶ رقم و بدون فاصله باشد.");
+                          return;
+                      }
+                      if (!m.matches("\\d{2}") || Integer.parseInt(m) < 1 || Integer.parseInt(m) > 12) {
+                          toast("ماه انقضا باید دو رقم بین 01 تا 12 باشد.");
+                          return;
+                      }
+                      if (!y.matches("\\d{2}")) {
+                          toast("سال انقضا باید دقیقاً دو رقم باشد.");
+                          return;
+                      }
+                      if (!c.matches("\\d{3,4}")) {
+                          toast("CVV2 باید ۳ یا ۴ رقم باشد.");
+                          return;
+                      }
+                      if (!s.isEmpty() && !s.matches("IR\\d{24}")) {
+                          toast("شماره شبا باید با IR و سپس ۲۴ رقم باشد.");
+                          return;
+                      }
+
+                      try {
+                          JSONObject item = new JSONObject();
+                          item.put("bank", b.isEmpty() ? "بانک" : b);
+                          item.put("number", n);
+                          item.put("shaba", s);
+                          item.put("month", m);
+                          item.put("year", y);
+                          item.put("cvv2", c);
+                          if (edit) cards.put(index, item); else cards.put(item);
+                          saveCards();
+                          showHome();
+                          toast(edit ? "کارت اصلاح شد." : "کارت ثبت شد.");
+                      } catch (Exception e) {
+                          toast("خطا در ذخیره کارت.");
+                      }
+                  });
+              }
+
+              private EditText field(String hint, String value) {
+                  EditText e = new EditText(this);
+                  e.setHint(hint);
+                  e.setText(value);
+                  e.setTextSize(16);
+                  e.setPadding(14, 8, 14, 8);
+                  return e;
+              }
+
+              private void toast(String s) {
+                  Toast.makeText(this, s, Toast.LENGTH_SHORT).show();
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  if (prefs != null && hasPin() && !unlocked) {
+                      // The app remains on its PIN screen until the user unlocks it.
+                  }
+              }
+          }
+          JAVA
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: CardVault-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
